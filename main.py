@@ -171,6 +171,19 @@ def find_best_name(text, priority_text=""):
                     if is_name_candidate(candidate):
                         candidates.append((source_rank, 900, candidate))
 
+                # Tesseract may split a two-word name into two separate lines
+                # (e.g. "Prasanta" / "Manna") immediately before DOB.
+                if i >= 2:
+                    first = clean_spaces(re.sub(r"^[^A-Za-z]+", "", lines[i - 2]))
+                    second = clean_spaces(re.sub(r"^[^A-Za-z]+", "", lines[i - 1]))
+                    if (
+                        re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", first)
+                        and re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", second)
+                    ):
+                        candidate = clean_spaces(f"{first} {second}")
+                        if is_name_candidate(candidate):
+                            candidates.append((source_rank, 980, candidate))
+
         # 3) General candidate scoring.
         for i, line in enumerate(lines):
             candidate = clean_spaces(re.sub(r"^[^A-Za-z]+", "", line))
@@ -247,20 +260,37 @@ def _ocr_with_confidence(image: Image.Image, psm: int = 6):
     return text, confidence
 
 
-def _crop_identity_region(image: Image.Image):
+def _crop_identity_region(image: Image.Image, document_type: str = ""):
     """
-    For photographed Aadhaar-style cards, the lower mini-card contains
-    a compact, high-value identity block (name/DOB/gender). The crop is
-    intentionally based on relative coordinates so it survives resizing.
+    Extract the high-value identity text block from a photographed
+    Aadhaar-style card.  The user's sample has the name/DOB/gender in the
+    lower mini-card; a tight crop plus explicit upscaling gives Tesseract
+    enough character resolution to read that block reliably.
+
+    For non-Aadhaar documents, keep the broader fallback crop.
     """
     width, height = image.size
+    kind = (document_type or "").lower()
 
-    # Lower identity card area. Keep enough surrounding context for labels.
+    if "aadhaar" in kind or "aadhar" in kind:
+        left = int(width * 0.30)
+        right = int(width * 0.70)
+        top = int(height * 0.655)
+        bottom = int(height * 0.725)
+        crop = image.crop((left, top, right, bottom))
+
+        # The identity text is physically small in a phone photograph.
+        # Upscale before OCR instead of merely limiting the max side.
+        crop = crop.resize(
+            (crop.width * 4, crop.height * 4),
+            Image.Resampling.LANCZOS,
+        )
+        return crop
+
     left = int(width * 0.18)
     right = int(width * 0.75)
     top = int(height * 0.60)
     bottom = int(height * 0.80)
-
     return image.crop((left, top, right, bottom))
 
 
@@ -302,7 +332,7 @@ def extract_text_from_image(image_bytes: bytes, document_type: str = ""):
 
         # Identity crop is smaller, so upscale it for much better character
         # separation. This is the key improvement for the user's photographed card.
-        identity_crop = _crop_identity_region(original)
+        identity_crop = _crop_identity_region(original, document_type=document_type)
         identity_prepared = preprocess_image(
             identity_crop,
             "normal",
