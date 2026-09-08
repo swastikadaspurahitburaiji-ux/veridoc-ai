@@ -56,54 +56,200 @@ def home():
 # OCR HELPERS
 # =========================================================
 
-def preprocess_image(image: Image.Image, mode: str = "normal") -> Image.Image:
-    """Fast OCR preprocessing for low-CPU cloud deployment."""
+def preprocess_image(image: Image.Image, mode: str) -> Image.Image:
+    """
+    Create OCR-friendly versions of the uploaded image.
+    This is still a prototype OCR pipeline.
+    """
     image = image.convert("RGB")
-    max_side = 1800
+
+    # Upscale small documents.
     width, height = image.size
-    scale = min(1.0, max_side / max(width, height))
-    if scale < 1.0:
-        image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.LANCZOS)
+    if width < 1600:
+        scale = 2
+        image = image.resize(
+            (width * scale, height * scale),
+            Image.Resampling.LANCZOS,
+        )
+
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray)
-    if mode == "threshold":
-        return gray.point(lambda p: 255 if p > 155 else 0)
+
     if mode == "sharp":
         return gray.filter(ImageFilter.SHARPEN)
+
+    if mode == "threshold":
+        # Adaptive-like simple threshold for clean document text.
+        return gray.point(lambda pixel: 255 if pixel > 155 else 0)
+
     return gray
 
 
-def ocr_confidence(image: Image.Image, psm: int = 6):
-    data = pytesseract.image_to_data(image, config=f"--psm {psm}", output_type=Output.DICT)
+def ocr_confidence(image: Image.Image, psm: int):
+    data = pytesseract.image_to_data(
+        image,
+        config=f"--psm {psm}",
+        output_type=Output.DICT,
+    )
+
     values = []
+
     for value in data.get("conf", []):
         try:
             number = float(value)
             if number >= 0:
                 values.append(number)
         except (ValueError, TypeError):
-            pass
-    return round(sum(values) / len(values), 2) if values else 0.0
+            continue
+
+    if not values:
+        return 0.0
+
+    return round(sum(values) / len(values), 2)
 
 
 def extract_text_from_image(image_bytes: bytes):
-    """Fast OCR: one primary pass, with one fallback only when confidence is low."""
+    """
+    Run several lightweight OCR passes and keep the strongest result.
+    """
     try:
         original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        prepared = preprocess_image(original, "normal")
-        text = pytesseract.image_to_string(prepared, config="--psm 6").strip()
-        confidence = ocr_confidence(prepared, 6)
 
-        if confidence < 35 or len(re.sub(r"[^A-Za-z0-9]", "", text)) < 12:
-            fallback = preprocess_image(original, "threshold")
-            fallback_text = pytesseract.image_to_string(fallback, config="--psm 6").strip()
-            fallback_confidence = ocr_confidence(fallback, 6)
-            if fallback_confidence > confidence:
-                text, confidence = fallback_text, fallback_confidence
+        candidates = []
 
-        return {"text": text, "confidence": confidence}
+        for mode in ("normal", "sharp", "threshold"):
+            prepared = preprocess_image(original, mode)
+
+            for psm in (6, 11):
+                text = pytesseract.image_to_string(
+                    prepared,
+                    config=f"--psm {psm}",
+                ).strip()
+
+                confidence = ocr_confidence(
+                    prepared,
+                    psm,
+                )
+
+                # Prefer confidence, with a small bonus for useful text.
+                useful_chars = len(
+                    re.findall(r"[A-Za-z0-9]", text)
+                )
+
+                ranking_score = confidence + min(
+                    useful_chars / 100,
+                    5,
+                )
+
+                candidates.append(
+                    {
+                        "text": text,
+                        "confidence": confidence,
+                        "ranking_score": ranking_score,
+                        "mode": mode,
+                        "psm": psm,
+                    }
+                )
+
+        if not candidates:
+            return {
+                "text": "",
+                "confidence": 0,
+            }
+
+        best = max(
+            candidates,
+            key=lambda item: item["ranking_score"],
+        )
+
+        return {
+            "text": best["text"],
+            "confidence": best["confidence"],
+        }
+
     except Exception as error:
-        raise Exception(f"OCR processing failed: {error}")
+        raise Exception(
+            f"OCR processing failed: {str(error)}"
+        )
+
+
+# =========================================================
+# IDENTITY EXTRACTION
+# =========================================================
+
+def clean_spaces(value: str) -> str:
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" :-|,.;")
+
+
+def mask_document_number(value: str) -> str:
+    digits = re.sub(r"\D", "", value)
+
+    if len(digits) >= 12:
+        digits = digits[-12:]
+        return f"XXXX XXXX {digits[-4:]}"
+
+    if len(digits) >= 4:
+        return f"XXXX XXXX {digits[-4:]}"
+
+    return "Not detected"
+
+
+def is_name_candidate(value: str) -> bool:
+    value = clean_spaces(value)
+    if not value or re.search(r"\d", value):
+        return False
+
+    words = re.findall(r"[A-Za-z][A-Za-z.'-]*", value)
+    if not 1 <= len(words) <= 4:
+        return False
+
+    excluded = {
+        "government", "india", "unique", "identification", "authority",
+        "enrolment", "enrollment", "aadhaar", "male", "female", "address",
+        "date", "birth", "dob", "resident", "proof", "uidai", "year",
+        "phone", "mobile", "valid", "issued", "signature", "help",
+        "helpline", "erasers", "era", "ht", "pas"
+    }
+
+    if any(word.lower() in excluded for word in words):
+        return False
+
+    joined = "".join(words).lower()
+    if len(joined) < 5:
+        return False
+
+    # A two-word or three-word name is much more plausible than a short fragment.
+    if len(words) == 1 and len(words[0]) < 5:
+        return False
+
+    return True
+
+
+def score_name_candidate(candidate: str, line_index: int, lines: list[str]) -> float:
+    words = candidate.split()
+    score = 0.0
+
+    if len(words) == 2:
+        score += 32
+    elif len(words) == 3:
+        score += 27
+    elif len(words) == 4:
+        score += 16
+    else:
+        score += 4
+
+    for word in words:
+        if len(word) >= 3:
+            score += 4
+        if word[0].isupper() or word.isupper():
+            score += 2
+
+    nearby = " ".join(lines[line_index:min(line_index + 4, len(lines))]).lower()
+    if re.search(r"\b(19|20)\d{2}\b|\bmale\b|\bfemale\b|\bdob\b|date of birth", nearby):
+        score += 12
+
+    return score
 
 
 def extract_identity_fields(text: str):
