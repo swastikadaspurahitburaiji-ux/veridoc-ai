@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import io
@@ -58,340 +58,327 @@ def home():
 # =========================================================
 
 def clean_spaces(text):
-    """Normalize repeated whitespace without changing the actual words."""
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
 def mask_document_number(digits):
-    """Mask an identity/document number while keeping the last 4 digits visible."""
     digits = re.sub(r"\D", "", str(digits))
     if len(digits) == 12:
         return f"XXXX XXXX {digits[-4:]}"
     if len(digits) >= 4:
-        return ("X" * (len(digits) - 4)) + digits[-4:]
+        return "X" * (len(digits) - 4) + digits[-4:]
     return "Not detected"
 
 
-NAME_BLOCKLIST = {
-    "government", "govt", "india", "unique", "identification",
-    "authority", "enrolment", "enrollment", "number", "no",
-    "aadhaar", "aadhar", "uidai", "male", "female", "gender",
-    "date", "birth", "dob", "address", "resident", "proof",
-    "identity", "identification", "card", "passport", "driving",
-    "licence", "license", "pan", "income", "tax", "department",
-    "year", "issue", "valid", "signature", "photo",
-    "relea", "reel", "receipt", "phone", "mobile",
-    "west", "beng", "bengal", "pin", "pincode", "road", "street",
-    "district", "state", "village", "town", "city",
-}
-
-
 def is_name_candidate(candidate):
-    """
-    Conservative name validator.
-    It is deliberately better to return 'Not detected' than to display
-    an obviously corrupted OCR phrase as a person's name.
-    """
     candidate = clean_spaces(candidate)
-    if not candidate:
+    if not candidate or len(candidate) < 3 or len(candidate) > 60:
         return False
 
-    # Names shown by this prototype are Latin-script OCR names.
-    if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]*", candidate):
+    # Avoid accepting numeric/address-like OCR fragments.
+    letters = re.findall(r"[A-Za-z]", candidate)
+    if len(letters) < 3:
         return False
 
-    words = [w.strip(".,:;'-") for w in candidate.split()]
-    words = [w for w in words if w]
-
-    # Typical identity-card names: 2–4 words.
-    if not (2 <= len(words) <= 4):
+    words = candidate.split()
+    if not (2 <= len(words) <= 5):
         return False
 
-    # Reject very short fragments such as "be WANN", which are common
-    # OCR artefacts in this sample.
-    if any(len(w) < 3 for w in words):
+    blocked = {
+        "government", "india", "male", "female", "address",
+        "dob", "date", "birth", "aadhaar", "uidai", "passport",
+        "driving", "licence", "license", "pan", "card",
+        "authority", "identification", "signature", "valid",
+        "enrolment", "enrollment", "number", "west", "bengal",
+    }
+    if any(w.lower().strip(".,:;-") in blocked for w in words):
         return False
 
-    if any(w.lower() in NAME_BLOCKLIST for w in words):
+    # Reject candidates that look like a sentence or address.
+    if any(ch.isdigit() for ch in candidate):
         return False
-
-    # A plausible name should contain enough alphabetic characters.
-    if sum(len(re.findall(r"[A-Za-z]", w)) for w in words) < 6:
+    if len(candidate) > 45:
         return False
 
     return True
 
 
-def score_name_candidate(candidate, index, lines, source_line):
-    """Score a plausible name using document-layout and OCR heuristics."""
+def score_name_candidate(candidate, index, lines):
     candidate = clean_spaces(candidate)
     words = candidate.split()
     score = 0
 
-    # 2–3 words are especially common on identity documents.
-    if len(words) == 2:
+    if 2 <= len(words) <= 4:
         score += 18
-    elif len(words) == 3:
-        score += 20
-    else:
+
+    if all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", w) for w in words):
         score += 10
 
-    # Prefer normal word lengths and penalize suspiciously long OCR strings.
-    for word in words:
-        if 3 <= len(word) <= 14:
-            score += 4
-        elif len(word) > 18:
-            score -= 10
+    # Strong signal when candidate follows a Name/Nam label.
+    if index > 0 and re.search(r"\b(?:name|nam)\b", lines[index - 1], re.I):
+        score += 50
 
-    # Strong signal when "Name" / "Nam" appears in the same or previous line.
-    if re.search(r"\b(?:name|nam)\b", source_line, re.IGNORECASE):
-        score += 55
-    if index > 0 and re.search(r"\b(?:name|nam)\b", lines[index - 1], re.IGNORECASE):
-        score += 45
+    # Strong signal when the candidate appears immediately before DOB.
+    if index + 1 < len(lines) and re.search(r"(?:dob|d\/o\/b|date\s*of\s*birth)", lines[index + 1], re.I):
+        score += 35
 
-    # Names on common identity cards are generally near the upper/middle
-    # part of the text, not in the footer.
-    score += max(0, 12 - min(index, 12))
-
-    # Penalize OCR-looking fragments.
-    if any(re.search(r"\d", w) for w in words):
-        score -= 30
-    if any(len(w) == 3 and w.isupper() for w in words):
-        score -= 3
+    # Identity-card text is generally near the beginning of the crop.
+    score += max(0, 10 - index)
 
     return score
 
 
-def _name_candidates_from_line(line):
-    """Generate short word windows so a name can be recovered from a noisy OCR line."""
-    words = re.findall(r"[A-Za-z][A-Za-z.'-]*", line)
-
-    # Remove common OCR label tokens before generating windows.
-    cleaned = []
-    for word in words:
-        if word.lower() in {"name", "nam"}:
-            continue
-        cleaned.append(word)
+def find_best_name(text, priority_text=""):
+    """
+    Extract a name conservatively. Priority OCR is normally the small
+    identity-card region where the name is printed, which is much more
+    reliable than OCR over the whole photographed document.
+    """
+    sources = []
+    if priority_text:
+        sources.append(priority_text)
+    sources.append(text)
 
     candidates = []
-    for size in (2, 3, 4):
-        for start in range(0, len(cleaned) - size + 1):
-            candidate = clean_spaces(" ".join(cleaned[start:start + size]))
+
+    for source_rank, source in enumerate(sources):
+        lines = [clean_spaces(line) for line in source.splitlines()]
+        lines = [line for line in lines if line]
+
+        # 1) Explicit Name/Nam label.
+        for i, line in enumerate(lines):
+            m = re.search(
+                r"(?:^|\b)(?:name|nam)\s*[:\-]?\s*([A-Za-z][A-Za-z .'-]{2,})$",
+                line,
+                flags=re.I,
+            )
+            if m:
+                candidate = clean_spaces(m.group(1))
+                if is_name_candidate(candidate):
+                    candidates.append((source_rank, 1000, candidate))
+
+            # OCR sometimes separates the label and value:
+            if re.fullmatch(r"(?:name|nam)\s*:?", line, flags=re.I) and i + 1 < len(lines):
+                candidate = clean_spaces(lines[i + 1])
+                if is_name_candidate(candidate):
+                    candidates.append((source_rank, 950, candidate))
+
+        # 2) A name immediately before DOB is a very strong layout signal.
+        for i, line in enumerate(lines):
+            if re.search(r"(?:dob|d\/o\/b|date\s*of\s*birth)", line, re.I):
+                if i > 0:
+                    candidate = clean_spaces(re.sub(r"^[^A-Za-z]+", "", lines[i - 1]))
+                    if is_name_candidate(candidate):
+                        candidates.append((source_rank, 900, candidate))
+
+        # 3) General candidate scoring.
+        for i, line in enumerate(lines):
+            candidate = clean_spaces(re.sub(r"^[^A-Za-z]+", "", line))
+            candidate = re.sub(r"\s{2,}", " ", candidate)
             if is_name_candidate(candidate):
-                candidates.append(candidate)
-    return candidates
+                score = score_name_candidate(candidate, i, lines)
+                candidates.append((source_rank, score, candidate))
 
+    if not candidates:
+        return "Not detected"
 
-def _normalize_name_candidate(candidate):
-    """Remove OCR punctuation while preserving the detected person's words."""
-    candidate = clean_spaces(candidate)
-    candidate = re.sub(r"^[^A-Za-z]+|[^A-Za-z.'-]+$", "", candidate)
-    candidate = clean_spaces(candidate)
-    return candidate
+    # Prefer priority source first, then strongest evidence.
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return candidates[0][2]
+
 
 
 # =========================================================
 # OCR HELPERS
 # =========================================================
 
-def preprocess_image(image: Image.Image, mode: str = "normal") -> Image.Image:
-    """Fast OCR preprocessing for low-CPU cloud deployment."""
-    image = image.convert("RGB")
-    max_side = 1800
+def preprocess_image(image: Image.Image, mode: str = "normal", max_side: int = 1800) -> Image.Image:
+    """Prepare an image for OCR while keeping cloud CPU usage reasonable."""
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
     width, height = image.size
     scale = min(1.0, max_side / max(width, height))
     if scale < 1.0:
-        image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.LANCZOS)
+        image = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray)
+
     if mode == "threshold":
         return gray.point(lambda p: 255 if p > 155 else 0)
+
     if mode == "sharp":
         return gray.filter(ImageFilter.SHARPEN)
+
     return gray
 
 
-def ocr_confidence(image: Image.Image, psm: int = 6):
-    data = pytesseract.image_to_data(image, config=f"--psm {psm}", output_type=Output.DICT)
-    values = []
-    for value in data.get("conf", []):
+def _ocr_with_confidence(image: Image.Image, psm: int = 6):
+    """Single Tesseract pass returning both text and confidence."""
+    data = pytesseract.image_to_data(
+        image,
+        config=f"--psm {psm}",
+        output_type=Output.DICT,
+    )
+
+    words = []
+    confidences = []
+
+    for i, value in enumerate(data.get("text", [])):
+        value = clean_spaces(value)
         try:
-            number = float(value)
-            if number >= 0:
-                values.append(number)
-        except (ValueError, TypeError):
-            pass
-    return round(sum(values) / len(values), 2) if values else 0.0
+            confidence = float(data.get("conf", ["-1"])[i])
+        except (ValueError, TypeError, IndexError):
+            confidence = -1
+
+        if value:
+            words.append(value)
+        if confidence >= 0:
+            confidences.append(confidence)
+
+    text = "\n".join(words)
+    confidence = round(
+        sum(confidences) / len(confidences), 2
+    ) if confidences else 0.0
+
+    return text, confidence
 
 
-def extract_text_from_image(image_bytes: bytes):
-    """Fast OCR: one primary pass, with one fallback only when confidence is low."""
+def _crop_identity_region(image: Image.Image):
+    """
+    For photographed Aadhaar-style cards, the lower mini-card contains
+    a compact, high-value identity block (name/DOB/gender). The crop is
+    intentionally based on relative coordinates so it survives resizing.
+    """
+    width, height = image.size
+
+    # Lower identity card area. Keep enough surrounding context for labels.
+    left = int(width * 0.18)
+    right = int(width * 0.75)
+    top = int(height * 0.60)
+    bottom = int(height * 0.80)
+
+    return image.crop((left, top, right, bottom))
+
+
+def extract_text_from_image(image_bytes: bytes, document_type: str = ""):
+    """
+    Fast but stronger OCR strategy:
+    1. OCR the main document area.
+    2. OCR the compact lower identity region separately.
+    3. Use the identity-region OCR as the preferred source for name/DOB/gender.
+
+    This avoids trying to infer identity fields from a noisy full-frame photo.
+    """
     try:
-        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        prepared = preprocess_image(original, "normal")
-        text = pytesseract.image_to_string(prepared, config="--psm 6").strip()
-        confidence = ocr_confidence(prepared, 6)
+        original = Image.open(io.BytesIO(image_bytes))
+        original = ImageOps.exif_transpose(original).convert("RGB")
 
-        if confidence < 35 or len(re.sub(r"[^A-Za-z0-9]", "", text)) < 12:
-            fallback = preprocess_image(original, "threshold")
-            fallback_text = pytesseract.image_to_string(fallback, config="--psm 6").strip()
-            fallback_confidence = ocr_confidence(fallback, 6)
-            if fallback_confidence > confidence:
-                text, confidence = fallback_text, fallback_confidence
+        width, height = original.size
 
-        return {"text": text, "confidence": confidence}
+        # Main document crop: remove most background while retaining the card.
+        main_left = int(width * 0.10)
+        main_right = int(width * 0.90)
+        main_top = int(height * 0.12)
+        main_bottom = int(height * 0.82)
+
+        main_crop = original.crop(
+            (main_left, main_top, main_right, main_bottom)
+        )
+
+        main_prepared = preprocess_image(
+            main_crop,
+            "normal",
+            max_side=1800,
+        )
+
+        main_text, main_confidence = _ocr_with_confidence(
+            main_prepared,
+            psm=6,
+        )
+
+        # Identity crop is smaller, so upscale it for much better character
+        # separation. This is the key improvement for the user's photographed card.
+        identity_crop = _crop_identity_region(original)
+        identity_prepared = preprocess_image(
+            identity_crop,
+            "normal",
+            max_side=1200,
+        )
+
+        identity_text, identity_confidence = _ocr_with_confidence(
+            identity_prepared,
+            psm=6,
+        )
+
+        combined_text = "\n".join(
+            part for part in (main_text, identity_text) if part
+        )
+
+        confidences = [
+            c for c in (main_confidence, identity_confidence)
+            if c > 0
+        ]
+        combined_confidence = round(
+            sum(confidences) / len(confidences),
+            2,
+        ) if confidences else 0.0
+
+        return {
+            "text": combined_text,
+            "confidence": combined_confidence,
+            "identity_text": identity_text,
+            "identity_confidence": identity_confidence,
+        }
+
     except Exception as error:
         raise Exception(f"OCR processing failed: {error}")
 
 
-def normalize_ocr_name(candidate):
-    """
-    Apply only high-confidence OCR spelling corrections.
-    These are conservative visual/OCR confusions, not identity lookups.
-    """
-    candidate = _normalize_name_candidate(candidate)
 
-    corrections = {
-        # Common OCR variants seen in the supplied synthetic demo document.
-        "presanta": "Prasanta",
-        "prasanta": "Prasanta",
-        "manne": "Manna",
-        "manna": "Manna",
-    }
-
-    words = candidate.split()
-    normalized = [corrections.get(word.lower(), word) for word in words]
-    return " ".join(normalized)
-
-
-def extract_identity_fields(text: str):
-    """
-    Conservative OCR-based identity extraction.
-
-    The name extractor does not hardcode a person's name. It looks for
-    label-adjacent names first, then evaluates short word windows from
-    noisy OCR lines. If the OCR is too corrupted, it returns 'Not detected'
-    instead of showing a misleading name.
-    """
-    raw_lines = [clean_spaces(line) for line in text.splitlines()]
-    lines = [line for line in raw_lines if line]
+def extract_identity_fields(text: str, priority_text: str = ""):
+    """Conservative OCR-based identity extraction."""
+    lines = [
+        clean_spaces(line)
+        for line in text.splitlines()
+        if clean_spaces(line)
+    ]
     lower_text = text.lower()
 
-    # -----------------------------------------------------
     # Date of birth
-    # -----------------------------------------------------
     dob = "Not detected"
     dob_patterns = [
         r"\b(0?[1-9]|[12][0-9]|3[01])[/-](0?[1-9]|1[0-2])[/-](19|20)\d{2}\b",
         r"\b(19|20)\d{2}[/-](0?[1-9]|1[0-2])[/-](0?[1-9]|[12][0-9]|3[01])\b",
     ]
     for pattern in dob_patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, priority_text or text)
         if match:
             dob = match.group(0)
             break
 
-    # -----------------------------------------------------
     # Gender
-    # -----------------------------------------------------
     gender = "Not detected"
-    if re.search(r"\bfemale\b|\bwoman\b|\bfema1e\b", lower_text):
+    gender_source = (priority_text or "") + "\n" + lower_text
+    if re.search(r"\bfemale\b|\bwoman\b|\bfema1e\b", gender_source, re.I):
         gender = "Female"
-    elif re.search(r"\bmale\b|\bman\b|\bma1e\b", lower_text):
+    elif re.search(r"\bmale\b|\bman\b|\bma1e\b", gender_source, re.I):
         gender = "Male"
 
-    # -----------------------------------------------------
     # Document number
-    # -----------------------------------------------------
     document_number = "Not detected"
-
-    # Accept spaces/hyphens between the 12 digits.
-    aadhaar_matches = re.findall(
-        r"(?<!\d)(?:\d[\s-]?){12}(?!\d)",
-        text,
-    )
+    aadhaar_matches = re.findall(r"(?<!\d)(?:\d[\s-]?){12}(?!\d)", text)
     for candidate in aadhaar_matches:
         digits = re.sub(r"\D", "", candidate)
         if len(digits) == 12:
             document_number = mask_document_number(digits)
             break
 
-    if document_number == "Not detected":
-        for line in lines:
-            if re.search(r"\b(?:aadhaar|aadhar)\b", line, re.IGNORECASE):
-                joined = "".join(re.findall(r"\d{4,}", line))
-                if len(joined) >= 12:
-                    document_number = mask_document_number(joined[-12:])
-                    break
-
-    # -----------------------------------------------------
-    # Name - robust, non-hardcoded extraction
-    # -----------------------------------------------------
-    name = "Not detected"
-    candidates = []
-
-    for index, line in enumerate(lines):
-        # 1) Highest priority: explicit "Name: ..." on the same line.
-        explicit = re.search(
-            r"(?:^|[^A-Za-z])(?:name|nam)\s*[:\-]?\s*"
-            r"([A-Za-z][A-Za-z .'-]{2,})",
-            line,
-            flags=re.IGNORECASE,
-        )
-        if explicit:
-            candidate = _normalize_name_candidate(explicit.group(1))
-
-            # Stop at obvious OCR/document labels that may follow the name.
-            candidate = re.split(
-                r"\b(?:ne|relea|reel|ao|dob|date|gender|male|female)\b",
-                candidate,
-                maxsplit=1,
-                flags=re.IGNORECASE,
-            )[0]
-            candidate = _normalize_name_candidate(candidate)
-            candidate = normalize_ocr_name(candidate)
-
-            if is_name_candidate(candidate):
-                candidates.append(
-                    (
-                        1000 + score_name_candidate(candidate, index, lines, line),
-                        candidate,
-                    )
-                )
-
-        # 2) Generate 2–4 word windows from every OCR line.
-        for candidate in _name_candidates_from_line(line):
-            candidate = normalize_ocr_name(candidate)
-            score = score_name_candidate(candidate, index, lines, line)
-
-            # If the candidate follows an obvious name label, strongly prefer it.
-            if re.search(r"\b(?:name|nam)\b", line, re.IGNORECASE):
-                score += 100
-            if re.search(r"\b(?:relea|reel|ao)\b", line, re.IGNORECASE):
-                score += 45
-
-            candidates.append((score, candidate))
-
-    if candidates:
-        # Deduplicate while retaining the best score for each spelling.
-        best_by_name = {}
-        for score, candidate in candidates:
-            key = candidate.lower()
-            if key not in best_by_name or score > best_by_name[key]:
-                best_by_name[key] = score
-
-        ranked = sorted(
-            ((score, candidate) for candidate, score in best_by_name.items()),
-            reverse=True,
-        )
-
-        if ranked:
-            best_score, best_name_key = ranked[0]
-            # Recover original capitalization from candidates.
-            for score, candidate in candidates:
-                if candidate.lower() == best_name_key and score == best_score:
-                    name = candidate
-                    break
+    # Name: priority identity crop first.
+    name = find_best_name(text, priority_text)
 
     return {
         "name": name,
@@ -399,7 +386,6 @@ def extract_identity_fields(text: str):
         "gender": gender,
         "document_number": document_number,
     }
-
 
 
 # =========================================================
@@ -624,6 +610,7 @@ def build_risk_explanation(
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
+    document_type: str = Form("Identity Document"),
 ):
     if not file.filename:
         raise HTTPException(
@@ -693,7 +680,8 @@ async def upload_document(
 
     try:
         ocr_result = extract_text_from_image(
-            file_bytes
+            file_bytes,
+            document_type=document_type,
         )
     except Exception as error:
         raise HTTPException(
@@ -706,7 +694,8 @@ async def upload_document(
     # -----------------------------------------------------
 
     identity_result = extract_identity_fields(
-        ocr_result["text"]
+        ocr_result["text"],
+        priority_text=ocr_result.get("identity_text", ""),
     )
 
     # -----------------------------------------------------
@@ -756,6 +745,7 @@ async def upload_document(
     return {
         "status": "success",
         "filename": file.filename,
+        "document_type": document_type,
         "content_type": content_type,
         "message": "Document screening completed successfully",
         "ocr": {
