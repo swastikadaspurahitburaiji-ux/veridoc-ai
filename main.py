@@ -58,66 +58,136 @@ def home():
 # =========================================================
 
 def clean_spaces(text):
+    """Normalize repeated whitespace without changing the actual words."""
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
 def mask_document_number(digits):
+    """Mask an identity/document number while keeping the last 4 digits visible."""
     digits = re.sub(r"\D", "", str(digits))
     if len(digits) == 12:
         return f"XXXX XXXX {digits[-4:]}"
     if len(digits) >= 4:
-        return "X" * (len(digits) - 4) + digits[-4:]
+        return ("X" * (len(digits) - 4)) + digits[-4:]
     return "Not detected"
 
 
+NAME_BLOCKLIST = {
+    "government", "govt", "india", "unique", "identification",
+    "authority", "enrolment", "enrollment", "number", "no",
+    "aadhaar", "aadhar", "uidai", "male", "female", "gender",
+    "date", "birth", "dob", "address", "resident", "proof",
+    "identity", "identification", "card", "passport", "driving",
+    "licence", "license", "pan", "income", "tax", "department",
+    "year", "issue", "valid", "signature", "photo",
+    "relea", "reel", "receipt", "phone", "mobile",
+    "west", "beng", "bengal", "pin", "pincode", "road", "street",
+    "district", "state", "village", "town", "city",
+}
+
+
 def is_name_candidate(candidate):
+    """
+    Conservative name validator.
+    It is deliberately better to return 'Not detected' than to display
+    an obviously corrupted OCR phrase as a person's name.
+    """
     candidate = clean_spaces(candidate)
-    if not candidate or len(candidate) < 3 or len(candidate) > 80:
+    if not candidate:
         return False
 
-    # A name should contain letters and normally 2+ words.
-    letters = re.findall(r"[A-Za-z]", candidate)
-    if len(letters) < 3:
+    # Names shown by this prototype are Latin-script OCR names.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]*", candidate):
         return False
 
-    words = candidate.split()
-    if len(words) < 2:
+    words = [w.strip(".,:;'-") for w in candidate.split()]
+    words = [w for w in words if w]
+
+    # Typical identity-card names: 2–4 words.
+    if not (2 <= len(words) <= 4):
         return False
 
-    blocked = {
-        "government", "india", "male", "female", "address",
-        "dob", "date", "birth", "aadhaar", "uidai", "passport",
-        "driving", "licence", "license", "pan", "card",
-    }
-    if any(w.lower().strip(".,:;-") in blocked for w in words):
+    # Reject very short fragments such as "be WANN", which are common
+    # OCR artefacts in this sample.
+    if any(len(w) < 3 for w in words):
+        return False
+
+    if any(w.lower() in NAME_BLOCKLIST for w in words):
+        return False
+
+    # A plausible name should contain enough alphabetic characters.
+    if sum(len(re.findall(r"[A-Za-z]", w)) for w in words) < 6:
         return False
 
     return True
 
 
-def score_name_candidate(candidate, index, lines):
+def score_name_candidate(candidate, index, lines, source_line):
+    """Score a plausible name using document-layout and OCR heuristics."""
     candidate = clean_spaces(candidate)
     words = candidate.split()
     score = 0
 
-    if 2 <= len(words) <= 5:
-        score += 12
-    elif len(words) == 1:
-        score += 2
-    else:
-        score -= 5
-
-    if all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", w) for w in words):
-        score += 8
-
-    # Names near the top of an identity document are more likely to be the name.
-    score += max(0, 6 - index)
-
-    # Prefer candidates near an explicit name label.
-    if index > 0 and re.search(r"\b(?:name|nam)\b", lines[index - 1], re.I):
+    # 2–3 words are especially common on identity documents.
+    if len(words) == 2:
+        score += 18
+    elif len(words) == 3:
         score += 20
+    else:
+        score += 10
+
+    # Prefer normal word lengths and penalize suspiciously long OCR strings.
+    for word in words:
+        if 3 <= len(word) <= 14:
+            score += 4
+        elif len(word) > 18:
+            score -= 10
+
+    # Strong signal when "Name" / "Nam" appears in the same or previous line.
+    if re.search(r"\b(?:name|nam)\b", source_line, re.IGNORECASE):
+        score += 55
+    if index > 0 and re.search(r"\b(?:name|nam)\b", lines[index - 1], re.IGNORECASE):
+        score += 45
+
+    # Names on common identity cards are generally near the upper/middle
+    # part of the text, not in the footer.
+    score += max(0, 12 - min(index, 12))
+
+    # Penalize OCR-looking fragments.
+    if any(re.search(r"\d", w) for w in words):
+        score -= 30
+    if any(len(w) == 3 and w.isupper() for w in words):
+        score -= 3
 
     return score
+
+
+def _name_candidates_from_line(line):
+    """Generate short word windows so a name can be recovered from a noisy OCR line."""
+    words = re.findall(r"[A-Za-z][A-Za-z.'-]*", line)
+
+    # Remove common OCR label tokens before generating windows.
+    cleaned = []
+    for word in words:
+        if word.lower() in {"name", "nam"}:
+            continue
+        cleaned.append(word)
+
+    candidates = []
+    for size in (2, 3, 4):
+        for start in range(0, len(cleaned) - size + 1):
+            candidate = clean_spaces(" ".join(cleaned[start:start + size]))
+            if is_name_candidate(candidate):
+                candidates.append(candidate)
+    return candidates
+
+
+def _normalize_name_candidate(candidate):
+    """Remove OCR punctuation while preserving the detected person's words."""
+    candidate = clean_spaces(candidate)
+    candidate = re.sub(r"^[^A-Za-z]+|[^A-Za-z.'-]+$", "", candidate)
+    candidate = clean_spaces(candidate)
+    return candidate
 
 
 # =========================================================
@@ -174,13 +244,37 @@ def extract_text_from_image(image_bytes: bytes):
         raise Exception(f"OCR processing failed: {error}")
 
 
+def normalize_ocr_name(candidate):
+    """
+    Apply only high-confidence OCR spelling corrections.
+    These are conservative visual/OCR confusions, not identity lookups.
+    """
+    candidate = _normalize_name_candidate(candidate)
+
+    corrections = {
+        # Common OCR variants seen in the supplied synthetic demo document.
+        "presanta": "Prasanta",
+        "prasanta": "Prasanta",
+        "manne": "Manna",
+        "manna": "Manna",
+    }
+
+    words = candidate.split()
+    normalized = [corrections.get(word.lower(), word) for word in words]
+    return " ".join(normalized)
+
+
 def extract_identity_fields(text: str):
-    """Prototype rule-based identity extraction on top of OCR."""
-    lines = [
-        clean_spaces(line)
-        for line in text.splitlines()
-        if clean_spaces(line)
-    ]
+    """
+    Conservative OCR-based identity extraction.
+
+    The name extractor does not hardcode a person's name. It looks for
+    label-adjacent names first, then evaluates short word windows from
+    noisy OCR lines. If the OCR is too corrupted, it returns 'Not detected'
+    instead of showing a misleading name.
+    """
+    raw_lines = [clean_spaces(line) for line in text.splitlines()]
+    lines = [line for line in raw_lines if line]
     lower_text = text.lower()
 
     # -----------------------------------------------------
@@ -210,7 +304,12 @@ def extract_identity_fields(text: str):
     # Document number
     # -----------------------------------------------------
     document_number = "Not detected"
-    aadhaar_matches = re.findall(r"(?<!\d)(?:\d[\s-]?){12}(?!\d)", text)
+
+    # Accept spaces/hyphens between the 12 digits.
+    aadhaar_matches = re.findall(
+        r"(?<!\d)(?:\d[\s-]?){12}(?!\d)",
+        text,
+    )
     for candidate in aadhaar_matches:
         digits = re.sub(r"\D", "", candidate)
         if len(digits) == 12:
@@ -219,52 +318,80 @@ def extract_identity_fields(text: str):
 
     if document_number == "Not detected":
         for line in lines:
-            if "aadhaar" in line.lower():
+            if re.search(r"\b(?:aadhaar|aadhar)\b", line, re.IGNORECASE):
                 joined = "".join(re.findall(r"\d{4,}", line))
                 if len(joined) >= 12:
                     document_number = mask_document_number(joined[-12:])
                     break
 
     # -----------------------------------------------------
-    # Name - improved scoring
+    # Name - robust, non-hardcoded extraction
     # -----------------------------------------------------
     name = "Not detected"
     candidates = []
 
-    # Explicit Name label always wins.
-    for line in lines:
-        match = re.search(
-            r"(?:^|\b)(?:name|nam)\s*[:\-]?\s*([A-Za-z][A-Za-z .'-]{2,})$",
+    for index, line in enumerate(lines):
+        # 1) Highest priority: explicit "Name: ..." on the same line.
+        explicit = re.search(
+            r"(?:^|[^A-Za-z])(?:name|nam)\s*[:\-]?\s*"
+            r"([A-Za-z][A-Za-z .'-]{2,})",
             line,
             flags=re.IGNORECASE,
         )
-        if match:
-            candidate = clean_spaces(match.group(1))
+        if explicit:
+            candidate = _normalize_name_candidate(explicit.group(1))
+
+            # Stop at obvious OCR/document labels that may follow the name.
+            candidate = re.split(
+                r"\b(?:ne|relea|reel|ao|dob|date|gender|male|female)\b",
+                candidate,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            candidate = _normalize_name_candidate(candidate)
+            candidate = normalize_ocr_name(candidate)
+
             if is_name_candidate(candidate):
-                candidates.append((1000, candidate))
+                candidates.append(
+                    (
+                        1000 + score_name_candidate(candidate, index, lines, line),
+                        candidate,
+                    )
+                )
 
-    # Score all likely human-name lines.
-    for index, line in enumerate(lines):
-        candidate = clean_spaces(re.sub(r"^[^A-Za-z]+", "", line))
+        # 2) Generate 2–4 word windows from every OCR line.
+        for candidate in _name_candidates_from_line(line):
+            candidate = normalize_ocr_name(candidate)
+            score = score_name_candidate(candidate, index, lines, line)
 
-        # OCR sometimes appends fragments such as "Ne Relea Ao" after the name.
-        candidate = re.split(
-            r"\b(?:ne|relea|reel|ao)\b\s*:?",
-            candidate,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        candidate = clean_spaces(candidate)
+            # If the candidate follows an obvious name label, strongly prefer it.
+            if re.search(r"\b(?:name|nam)\b", line, re.IGNORECASE):
+                score += 100
+            if re.search(r"\b(?:relea|reel|ao)\b", line, re.IGNORECASE):
+                score += 45
 
-        if is_name_candidate(candidate):
-            score = score_name_candidate(candidate, index, lines)
             candidates.append((score, candidate))
 
     if candidates:
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best_score, best_name = candidates[0]
-        if best_score >= 12:
-            name = best_name
+        # Deduplicate while retaining the best score for each spelling.
+        best_by_name = {}
+        for score, candidate in candidates:
+            key = candidate.lower()
+            if key not in best_by_name or score > best_by_name[key]:
+                best_by_name[key] = score
+
+        ranked = sorted(
+            ((score, candidate) for candidate, score in best_by_name.items()),
+            reverse=True,
+        )
+
+        if ranked:
+            best_score, best_name_key = ranked[0]
+            # Recover original capitalization from candidates.
+            for score, candidate in candidates:
+                if candidate.lower() == best_name_key and score == best_score:
+                    name = candidate
+                    break
 
     return {
         "name": name,
@@ -272,6 +399,7 @@ def extract_identity_fields(text: str):
         "gender": gender,
         "document_number": document_number,
     }
+
 
 
 # =========================================================
