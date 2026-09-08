@@ -52,6 +52,74 @@ def home():
     }
 
 
+
+# =========================================================
+# IDENTITY EXTRACTION HELPERS
+# =========================================================
+
+def clean_spaces(text):
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def mask_document_number(digits):
+    digits = re.sub(r"\D", "", str(digits))
+    if len(digits) == 12:
+        return f"XXXX XXXX {digits[-4:]}"
+    if len(digits) >= 4:
+        return "X" * (len(digits) - 4) + digits[-4:]
+    return "Not detected"
+
+
+def is_name_candidate(candidate):
+    candidate = clean_spaces(candidate)
+    if not candidate or len(candidate) < 3 or len(candidate) > 80:
+        return False
+
+    # A name should contain letters and normally 2+ words.
+    letters = re.findall(r"[A-Za-z]", candidate)
+    if len(letters) < 3:
+        return False
+
+    words = candidate.split()
+    if len(words) < 2:
+        return False
+
+    blocked = {
+        "government", "india", "male", "female", "address",
+        "dob", "date", "birth", "aadhaar", "uidai", "passport",
+        "driving", "licence", "license", "pan", "card",
+    }
+    if any(w.lower().strip(".,:;-") in blocked for w in words):
+        return False
+
+    return True
+
+
+def score_name_candidate(candidate, index, lines):
+    candidate = clean_spaces(candidate)
+    words = candidate.split()
+    score = 0
+
+    if 2 <= len(words) <= 5:
+        score += 12
+    elif len(words) == 1:
+        score += 2
+    else:
+        score -= 5
+
+    if all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", w) for w in words):
+        score += 8
+
+    # Names near the top of an identity document are more likely to be the name.
+    score += max(0, 6 - index)
+
+    # Prefer candidates near an explicit name label.
+    if index > 0 and re.search(r"\b(?:name|nam)\b", lines[index - 1], re.I):
+        score += 20
+
+    return score
+
+
 # =========================================================
 # OCR HELPERS
 # =========================================================
