@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import io
 import re
+import json
+import math
+from pathlib import Path
 
 import pytesseract
 from pytesseract import Output
@@ -15,6 +18,13 @@ from PIL import (
     ImageChops,
 )
 
+# Prototype validation layer: synthetic reference database + consistency checks.
+# This is intentionally separate from OCR/ML/forensics and uses no real government data.
+try:
+    from validation_layer import validate_identity
+except Exception:
+    validate_identity = None
+
 
 # =========================================================
 # VERIDOC AI API
@@ -25,6 +35,116 @@ app = FastAPI(
     description="AI-assisted identity and document screening backend",
     version="1.2.0",
 )
+
+
+# =========================================================
+# ML MODEL
+# =========================================================
+MODEL_PATH = Path(__file__).with_name("document_screening_model.json")
+ML_MODEL = None
+
+if MODEL_PATH.exists():
+    try:
+        ML_MODEL = json.loads(MODEL_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        ML_MODEL = None
+
+
+def _sigmoid(value):
+    value = max(-40.0, min(40.0, float(value)))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def build_ml_features(ocr_result, forensic_result, identity_result):
+    """Create the same feature set used during model training."""
+    fields = [
+        identity_result.get("name"),
+        identity_result.get("date_of_birth"),
+        identity_result.get("gender"),
+        identity_result.get("document_number"),
+    ]
+    available = sum(
+        1 for value in fields
+        if value and str(value).strip().lower() not in {
+            "not detected",
+            "not confidently detected",
+        }
+    )
+    field_completeness = available / len(fields)
+
+    document_number_present = int(
+        identity_result.get("document_number") not in {None, "", "Not detected"}
+    )
+    date_present = int(
+        identity_result.get("date_of_birth") not in {None, "", "Not detected"}
+    )
+    gender_present = int(
+        identity_result.get("gender") not in {None, "", "Not detected"}
+    )
+
+    authenticity_score = float(
+        forensic_result.get("authenticity_score", 0)
+    )
+
+    # Prototype layout signal derived from the existing visual-signal score.
+    layout_consistency = max(0.0, min(1.0, authenticity_score / 100.0))
+
+    return [
+        float(ocr_result.get("confidence", 0)),
+        authenticity_score,
+        float(forensic_result.get("anomaly_score", 0)),
+        float(forensic_result.get("image_width", 0)),
+        float(forensic_result.get("image_height", 0)),
+        field_completeness,
+        document_number_present,
+        date_present,
+        gender_present,
+        layout_consistency,
+    ]
+
+
+def predict_with_ml(feature_values):
+    """
+    Run inference using the trained logistic-regression model.
+    Returns None if the model file is not available.
+    """
+    if not ML_MODEL:
+        return None
+
+    means = ML_MODEL["feature_mean"]
+    stds = ML_MODEL["feature_std"]
+    weights = ML_MODEL["weights"]
+    bias = ML_MODEL["bias"]
+
+    z = float(bias)
+
+    for value, mean, std, weight in zip(
+        feature_values, means, stds, weights
+    ):
+        safe_std = float(std) if float(std) != 0 else 1.0
+        z += ((float(value) - float(mean)) / safe_std) * float(weight)
+
+    genuine_probability = _sigmoid(z)
+    suspicious_probability = 1.0 - genuine_probability
+
+    if genuine_probability >= 0.70:
+        decision = "LIKELY GENUINE"
+    elif genuine_probability <= 0.30:
+        decision = "SUSPICIOUS"
+    else:
+        decision = "MANUAL REVIEW"
+
+    return {
+        "available": True,
+        "model_type": ML_MODEL.get("model_type", "Logistic Regression"),
+        "genuine_probability": round(genuine_probability * 100, 2),
+        "suspicious_probability": round(suspicious_probability * 100, 2),
+        "decision": decision,
+        "trained_dataset_rows": ML_MODEL.get("dataset_rows"),
+        "test_accuracy": round(
+            float(ML_MODEL.get("test_accuracy", 0)) * 100, 2
+        ),
+    }
 
 
 # =========================================================
@@ -634,6 +754,49 @@ def build_risk_explanation(
 
 
 # =========================================================
+# PROTOTYPE DOCUMENT VALIDATION
+# =========================================================
+
+def detect_document_type(text: str):
+    """Detect document type from OCR text using transparent prototype rules."""
+    u = str(text or "").upper()
+    if ("AADHAAR" in u or "UIDAI" in u or "UNIQUE IDENTIFICATION" in u
+            or re.search(r"\b\d{4}\s?\d{4}\s?\d{4}\b", u)):
+        return "Aadhaar Card"
+    if ("PERMANENT ACCOUNT NUMBER" in u or "INCOME TAX DEPARTMENT" in u
+            or re.search(r"\b[A-Z]{5}\d{4}[A-Z]\b", u)):
+        return "PAN Card"
+    if "PASSPORT" in u:
+        return "Passport"
+    if ("DRIVING LICENCE" in u or "DRIVING LICENSE" in u
+            or re.search(r"\bDL\s*(NO|NUMBER)\b", u)):
+        return "Driving Licence"
+    return "Unknown"
+
+
+def local_basic_validation(identity_result, selected_type, ocr_text):
+    """Fallback validation used if validation_layer.py is unavailable."""
+    detected = detect_document_type(ocr_text)
+    issues = []
+    if detected != "Unknown" and selected_type and detected.casefold() != selected_type.casefold():
+        issues.append({"field": "document_type", "selected": selected_type, "detected": detected})
+    numbers = re.findall(r"(?<!\d)(?:\d[\s-]?){12}(?!\d)", str(ocr_text or ""))
+    unique_numbers = {re.sub(r"\D", "", x) for x in numbers}
+    if len(unique_numbers) > 1:
+        issues.append({"field": "multiple_identity", "count": len(unique_numbers), "reason": "More than one Aadhaar-like identity number was detected."})
+    return {
+        "status": "PASS" if not issues else ("MANUAL REVIEW" if any(i["field"] == "multiple_identity" for i in issues) else "FAIL"),
+        "database_available": False,
+        "detected_document_type": detected,
+        "matched_record": None,
+        "multiple_identities": any(i["field"] == "multiple_identity" for i in issues),
+        "identity_candidates": [],
+        "mismatches": issues,
+        "message": "Basic prototype consistency checks completed."
+    }
+
+
+# =========================================================
 # UPLOAD + SCREENING
 # =========================================================
 
@@ -769,6 +932,45 @@ async def upload_document(
     )
 
     # -----------------------------------------------------
+    # ML inference
+    # -----------------------------------------------------
+    ml_features = build_ml_features(
+        ocr_result=ocr_result,
+        forensic_result=forensic_result,
+        identity_result=identity_result,
+    )
+    ml_result = predict_with_ml(ml_features)
+
+    # -----------------------------------------------------
+    # Document + database consistency validation
+    # -----------------------------------------------------
+    if validate_identity is not None:
+        try:
+            validation_result = validate_identity(
+                identity=identity_result,
+                selected_type=document_type,
+                ocr_text=ocr_result["text"],
+            )
+        except Exception as error:
+            validation_result = local_basic_validation(
+                identity_result, document_type, ocr_result["text"]
+            )
+            validation_result["message"] = (
+                "Validation fallback used because the prototype database layer could not be loaded."
+            )
+    else:
+        validation_result = local_basic_validation(
+            identity_result, document_type, ocr_result["text"]
+        )
+
+    # The final decision is server-generated. The frontend does not send or edit
+    # extracted identity fields, which prevents client-side result manipulation.
+    if validation_result.get("status") in {"FAIL", "MANUAL REVIEW"}:
+        if ml_result and ml_result.get("decision") == "LIKELY GENUINE":
+            ml_result = dict(ml_result)
+            ml_result["decision"] = "MANUAL REVIEW"
+
+    # -----------------------------------------------------
     # Final response
     # -----------------------------------------------------
 
@@ -789,4 +991,62 @@ async def upload_document(
             "level": risk_level,
         },
         "risk_explanation": risk_explanation,
+        "ml": ml_result,
+        "verification_status": build_verification_status(
+            document_type,
+            validation_result.get("detected_document_type", "Unable to determine"),
+            validation_result,
+            forensic_result,
+            ml_result,
+        ),
+        "validation": validation_result,
+        "detected_document_type": validation_result.get("detected_document_type", "Unknown"),
     }
+
+
+
+def build_verification_status(selected_type, detected_type, db_validation, forensics, ml_result):
+    """Conservative prototype verdict logic.
+
+    A missing reference-database record is NOT treated as proof of invalidity.
+    """
+    reasons = []
+
+    if detected_type and detected_type != "Unable to determine":
+        if selected_type and selected_type.lower() != detected_type.lower():
+            reasons.append("Document type mismatch")
+
+    if isinstance(db_validation, dict):
+        db_status = str(db_validation.get("status", "")).upper()
+        if db_status in {"MISMATCH", "DUPLICATE"}:
+            reasons.append("Reference data mismatch or duplicate record")
+        elif db_status in {"NOT_FOUND", "UNAVAILABLE"}:
+            reasons.append("Reference record unavailable; manual review required")
+
+    if isinstance(forensics, dict):
+        tamper = str(forensics.get("tampering_status", "")).upper()
+        if tamper in {"FAIL", "SUSPICIOUS", "TAMPERING_DETECTED"}:
+            reasons.append("Possible document tampering")
+
+    if isinstance(ml_result, dict):
+        decision = str(ml_result.get("decision", "")).upper()
+        if decision == "SUSPICIOUS":
+            reasons.append("Screening model indicates possible concern")
+
+    # Hard mismatch/forensic concern first.
+    hard = any(x in reasons for x in [
+        "Document type mismatch",
+        "Reference data mismatch or duplicate record",
+        "Possible document tampering",
+    ])
+    if hard:
+        return {"status": "INVALID", "level": "HIGH CONCERN", "reasons": reasons}
+
+    # No reference record or uncertain automated result => manual review.
+    if any("manual review" in x.lower() for x in reasons):
+        return {"status": "MANUAL REVIEW", "level": "REVIEW", "reasons": reasons}
+
+    if any("possible concern" in x.lower() for x in reasons):
+        return {"status": "MANUAL REVIEW", "level": "REVIEW", "reasons": reasons}
+
+    return {"status": "SCREENING PASS", "level": "LOW CONCERN", "reasons": reasons}

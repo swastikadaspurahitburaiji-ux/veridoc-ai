@@ -1,0 +1,60 @@
+{
+  "model_type": "Logistic Regression",
+  "algorithm": "Binary logistic regression trained with gradient descent",
+  "dataset": "Prototype synthetic/curated screening dataset",
+  "dataset_rows": 3000,
+  "features": [
+    "ocr_confidence",
+    "authenticity_score",
+    "anomaly_score",
+    "image_width",
+    "image_height",
+    "field_completeness",
+    "document_number_present",
+    "date_present",
+    "gender_present",
+    "layout_consistency"
+  ],
+  "feature_mean": [
+    84.19975208136421,
+    83.96085841047191,
+    12.633875962875027,
+    1749.0154166666666,
+    1296.87625,
+    0.7555491873423783,
+    0.7354166666666667,
+    0.7366666666666667,
+    0.7045833333333333,
+    0.6666145287131943
+  ],
+  "feature_std": [
+    9.593713083913082,
+    9.8041353760085,
+    9.353390747374705,
+    716.1583025739911,
+    511.4231696315076,
+    0.10416331862601833,
+    0.4411110892457304,
+    0.4404416974911495,
+    0.4562298321265478,
+    0.14299627392207245
+  ],
+  "weights": [
+    1.5829841825543498,
+    1.6944570904583567,
+    -1.0367531490885618,
+    0.05933081735947399,
+    -0.0030867311025973686,
+    0.8617703142300387,
+    1.3122724094657838,
+    1.3506231719505932,
+    1.0772600630730733,
+    0.8884445467203523
+  ],
+  "bias": -0.34596155026721903,
+  "test_accuracy": 0.8767,
+  "decision_rule": {
+    "genuine_probability": "<= 0.30 => Suspicious",
+    "otherwise": "Manual Review"
+  }
+}

@@ -1,0 +1,50 @@
+[
+  {
+    "document_number": "XXXX XXXX 1001",
+    "document_type": "Aadhaar Card",
+    "name": "Riya Sharma",
+    "date_of_birth": "01/01/2000",
+    "gender": "Female",
+    "status": "ACTIVE"
+  },
+  {
+    "document_number": "XXXX XXXX 1002",
+    "document_type": "Aadhaar Card",
+    "name": "Suman Roy",
+    "date_of_birth": "10/05/2001",
+    "gender": "Male",
+    "status": "ACTIVE"
+  },
+  {
+    "document_number": "ABCDE1234F",
+    "document_type": "PAN Card",
+    "name": "Amit Das",
+    "date_of_birth": "02/02/1999",
+    "gender": "Male",
+    "status": "ACTIVE"
+  },
+  {
+    "document_number": "FGHIJ5678K",
+    "document_type": "PAN Card",
+    "name": "Priya Sen",
+    "date_of_birth": "12/08/1998",
+    "gender": "Female",
+    "status": "ACTIVE"
+  },
+  {
+    "document_number": "P0000001",
+    "document_type": "Passport",
+    "name": "Arjun Mehta",
+    "date_of_birth": "03/03/1997",
+    "gender": "Male",
+    "status": "ACTIVE"
+  },
+  {
+    "document_number": "DL000001",
+    "document_type": "Driving Licence",
+    "name": "Neha Roy",
+    "date_of_birth": "04/04/1996",
+    "gender": "Female",
+    "status": "ACTIVE"
+  }
+]
